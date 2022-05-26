@@ -1,0 +1,623 @@
+from itertools import islice
+from abc import ABCMeta, abstractmethod, abstractstaticmethod
+from dataclasses import dataclass
+from functools import partial
+from typing import List
+
+import tensorflow as tf
+import math
+
+import numpy as np
+from sklearn.base import (
+    BaseEstimator,
+    ClassifierMixin,
+    MultiOutputMixin,
+    RegressorMixin,
+)
+from sklearn.model_selection import train_test_split
+import torch
+
+from .model import LassoNet
+
+
+def abstractattr(f):
+    return property(abstractmethod(f))
+
+
+@dataclass
+class HistoryItem:
+    lambda_: float
+    state_dict: dict
+    objective: float  # loss + lambda_ * regulatization
+    loss: float
+    val_objective: float  # val_loss + lambda_ * regulatization
+    val_loss: float
+    regularization: float
+    l2_regularization: float
+    l2_regularization_skip: float
+    selected: torch.BoolTensor
+    n_iters: int
+
+
+class BaseLassoNet(BaseEstimator, metaclass=ABCMeta):
+    def __init__(
+        self,
+        *,
+        hidden_dims=(100,),
+        eps_start=1,
+        lambda_start=None,
+        lambda_seq=None,
+        gamma=0.0,
+        gamma_skip=0.0,
+        path_multiplier=1.02,
+        M=10,
+        dropout=0,
+        batch_size=None,
+        optim=None,
+        n_iters=(1000, 100),
+        patience=(100, 10),
+        tol=0.99,
+        backtrack=False,
+        val_size=0.1,
+        device=None,
+        verbose=0,
+        random_state=None,
+        torch_seed=None,
+    ):
+        """
+        Parameters
+        ----------
+        hidden_dims : tuple of int, default=(100,)
+            Shape of the hidden layers.
+        eps_start : float, default=1
+            Sets lambda_start such that it has a strength comparable to the
+            loss of the unconstrained model multiplied by eps_start.
+        lambda_start : float, default=None
+            First value on the path.
+        lambda_seq : iterable of float
+            If specified, the model will be trained on this sequence
+            of values, until all coefficients are zero.
+            The dense model will always be trained first.
+            Note: lambda_start and path_multiplier will be ignored.
+        gamma : float, default=0.0
+            l2 penalization on the network
+        gamma : float, default=0.0
+            l2 penalization on the skip connection
+        path_multiplier : float
+            Multiplicative factor (:math:`1 + \\epsilon`) to increase
+            the penalty parameter over the path
+        M : float, default=10.0
+            Hierarchy parameter.
+        dropout : float, default = None
+        batch_size : int, default=None
+            If None, does not use batches. Batches are shuffled at each epoch.
+        optim : torch optimizer or tuple of 2 optimizers, default=None
+            Optimizer for initial training and path computation.
+            Default is Adam(lr=1e-3), SGD(lr=1e-3, momentum=0.9).
+        n_iters : int or pair of int, default=(1000, 100)
+            Maximum number of training epochs for initial training and path computation.
+            This is an upper-bound on the effective number of epochs, since the model
+            uses early stopping.
+        patience : int or pair of int, default=10
+            Number of epochs to wait without improvement during early stopping.
+        tol : float, default=0.99
+            Minimum improvement for early stopping: new objective < tol * old objective.
+        backtrack : bool, default=False
+            If true, ensures the objective function decreases.
+        val_size : float, default=0.1
+            Proportion of data to use for early stopping.
+            If X_val and y_val are given during training, it will be ignored.
+        device : torch device, default=None
+            Device on which to train the model using PyTorch.
+            Default: GPU if available else CPU
+        verbose : int, default=0
+        random_state
+            Random state for validation
+        torch_seed
+            Torch state for model random initialization
+        """
+
+        self.hidden_dims = hidden_dims
+        self.eps_start = eps_start
+        self.lambda_start = lambda_start
+        self.lambda_seq = lambda_seq
+        self.gamma = gamma
+        self.gamma_skip = gamma_skip
+        self.path_multiplier = path_multiplier
+        self.M = M
+        self.dropout = dropout
+        self.batch_size = batch_size
+        self.optim = optim
+        if optim is None:
+            optim = (
+                partial(torch.optim.Adam, lr=1e-3),
+                partial(torch.optim.SGD, lr=1e-3, momentum=0.9),
+            )
+        if isinstance(optim, partial):
+            optim = (optim, optim)
+        self.optim_init, self.optim_path = optim
+        if isinstance(n_iters, int):
+            n_iters = (n_iters, n_iters)
+        self.n_iters = self.n_iters_init, self.n_iters_path = n_iters
+        if patience is None or isinstance(patience, int):
+            patience = (patience, patience)
+        self.patience = self.patience_init, self.patience_path = patience
+        self.tol = tol
+        self.backtrack = backtrack
+        self.val_size = val_size
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
+
+        self.verbose = verbose
+
+        self.random_state = random_state
+        self.torch_seed = torch_seed
+
+        self.model = None
+
+    @abstractmethod
+    def _convert_y(self, y) -> torch.TensorType:
+        """Convert y to torch tensor"""
+        raise NotImplementedError
+
+    @abstractstaticmethod
+    def _output_shape(cls, y):
+        """Number of model outputs"""
+        raise NotImplementedError
+
+    @abstractattr
+    def criterion(cls):
+        raise NotImplementedError
+
+    def _init_model(self, X, y):
+        """Create a torch model"""
+        output_shape = self._output_shape(y)
+        if self.torch_seed is not None:
+            torch.manual_seed(self.torch_seed)
+        self.model = LassoNet(
+            X.shape[1], *self.hidden_dims, output_shape, dropout=self.dropout
+        ).to(self.device)
+
+    def _cast_input(self, X, y=None):
+        X = torch.FloatTensor(X).to(self.device)
+        if y is None:
+            return X
+        y = self._convert_y(y)
+        return X, y
+
+    def fit(self, X, y, *, X_val=None, y_val=None):
+        """Train the model.
+        Note that if `lambda_` is not given, the trained model
+        will most likely not use any feature.
+        """
+        self.path(X, y, X_val=X_val, y_val=y_val)
+        return self
+
+    def _train(
+        self,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        *,
+        batch_size,
+        epochs,
+        lambda_,
+        optimizer,
+        patience=None,
+    ) -> HistoryItem:
+        model = self.model
+
+        def validation_obj():
+            with torch.no_grad():
+                model.eval()
+                return (
+                    self.criterion(model(X_val), y_val).item()
+                    + lambda_ * model.l1_regularization_skip().item()
+                    + self.gamma * model.l2_regularization().item()
+                    + self.gamma_skip * model.l2_regularization_skip().item()
+                )
+
+        best_val_obj = validation_obj()
+        epochs_since_best_val_obj = 0
+        if self.backtrack:
+            best_state_dict = self.model.cpu_state_dict()
+            real_best_val_obj = best_val_obj
+            real_loss = float("nan")  # if epochs == 0
+
+        n_iters = 0
+
+        n_train = len(X_train)
+        if batch_size is None:
+            batch_size = n_train
+            randperm = torch.arange
+        else:
+            randperm = torch.randperm
+        batch_size = min(batch_size, n_train)
+
+        for epoch in range(epochs):
+            indices = randperm(n_train)
+            model.train()
+            loss = 0
+            for i in range(n_train // batch_size):
+                # don't take batches that are not full
+                batch = indices[i * batch_size : (i + 1) * batch_size]
+
+                def closure():
+                    nonlocal loss
+                    optimizer.zero_grad()
+                    ans = (
+                        self.criterion(model(X_train[batch]), y_train[batch])
+                        + self.gamma * model.l2_regularization()
+                        + self.gamma_skip * model.l2_regularization_skip()
+                    )
+                    ans.backward()
+                    loss += ans.item() * len(batch) / n_train
+                    return ans
+
+                optimizer.step(closure)
+                if lambda_:
+                    model.prox(
+                        lambda_=lambda_ * optimizer.param_groups[0]["lr"], M=self.M
+                    )
+
+            if epoch == 0:
+                # fallback to running loss of first epoch
+                real_loss = loss
+            val_obj = validation_obj()
+            if val_obj < self.tol * best_val_obj:
+                best_val_obj = val_obj
+                epochs_since_best_val_obj = 0
+            else:
+                epochs_since_best_val_obj += 1
+            if self.backtrack and val_obj < real_best_val_obj:
+                best_state_dict = self.model.cpu_state_dict()
+                real_best_val_obj = val_obj
+                real_loss = loss
+                n_iters = epoch + 1
+            if patience is not None and epochs_since_best_val_obj == patience:
+                break
+
+        if self.backtrack:
+            self.model.load_state_dict(best_state_dict)
+            val_obj = real_best_val_obj
+            loss = real_loss
+        else:
+            n_iters = epoch + 1
+        with torch.no_grad():
+            reg = self.model.l1_regularization_skip().item()
+            l2_regularization = self.model.l2_regularization()
+            l2_regularization_skip = self.model.l2_regularization_skip()
+        return HistoryItem(
+            lambda_=lambda_,
+            state_dict=self.model.cpu_state_dict(),
+            objective=loss + lambda_ * reg,
+            loss=loss,
+            val_objective=val_obj,
+            val_loss=val_obj - lambda_ * reg,
+            regularization=reg,
+            l2_regularization=l2_regularization,
+            l2_regularization_skip=l2_regularization_skip,
+            selected=self.model.input_mask().cpu(),
+            n_iters=n_iters,
+        )
+
+    @abstractmethod
+    def predict(self, X):
+        raise NotImplementedError
+
+    @abstractstaticmethod
+    def _lambda_max(X, y):
+        raise NotImplementedError
+
+    def path(self, X, y, *, X_val=None, y_val=None) -> List[HistoryItem]:
+        """Train LassoNet on a lambda_ path.
+        The path is defined by the class parameters:
+        start at `eps * lambda_max` and increment according
+        to `path_multiplier` or `n_lambdas`.
+        The path will stop when no feature is being used anymore.
+        """
+        assert (X_val is None) == (
+            y_val is None
+        ), "You must specify both or none of X_val and y_val"
+        sample_val = X_val is None
+        if sample_val:
+            X_train, X_val, y_train, y_val = train_test_split(
+                X, y, test_size=self.val_size, random_state=self.random_state
+            )
+        else:
+            X_train, y_train = X, y
+        X_train, y_train = self._cast_input(X_train, y_train)
+        X_val, y_val = self._cast_input(X_val, y_val)
+
+        hist: List[HistoryItem] = []
+
+        if self.model is None:
+            self._init_model(X_train, y_train)
+
+        hist.append(
+            self._train(
+                X_train,
+                y_train,
+                X_val,
+                y_val,
+                batch_size=self.batch_size,
+                lambda_=0,
+                epochs=self.n_iters_init,
+                optimizer=self.optim_init(self.model.parameters()),
+                patience=self.patience_init,
+            )
+        )
+        if self.verbose:
+            print(
+                f"Initialized dense model in {hist[-1].n_iters} epochs, "
+                f"val loss {hist[-1].val_loss:.2e}, "
+                f"regularization {hist[-1].regularization:.2e}"
+            )
+
+        # build lambda_seq
+        lambda_seq = self.lambda_seq
+        if lambda_seq is None:
+
+            def _lambda_seq(start):
+                while True:
+                    yield start
+                    start *= self.path_multiplier
+
+            if self.lambda_start is not None:
+                lambda_seq = _lambda_seq(self.lambda_start)
+            else:
+                # don't take hist[-1].regularization into account!
+                lambda_seq = _lambda_seq(self.eps_start * hist[-1].val_loss)
+
+        optimizer = self.optim_path(self.model.parameters())
+
+        for current_lambda in lambda_seq:
+            if self.model.selected_count() == 0:
+                break
+            hist.append(
+                self._train(
+                    X_train,
+                    y_train,
+                    X_val,
+                    y_val,
+                    batch_size=self.batch_size,
+                    lambda_=current_lambda,
+                    epochs=self.n_iters_path,
+                    optimizer=optimizer,
+                    patience=self.patience_path,
+                )
+            )
+            last = hist[-1]
+            if self.verbose:
+                print(
+                    f"Lambda = {current_lambda:.2e}, "
+                    f"selected {self.model.selected_count()} features "
+                    f"in {last.n_iters} epochs"
+                )
+                print(
+                    f"val_objective "
+                    f"{last.val_objective:.2e}, "
+                    f"val_loss "
+                    f"{last.val_loss:.2e}, "
+                    f"regularization {last.regularization:.2e}"
+                )
+
+        self.feature_importances_ = self._compute_feature_importances(hist)
+        """When does each feature disappear on the path?"""
+
+        return hist
+
+    @staticmethod
+    def _compute_feature_importances(path: List[HistoryItem]):
+        """When does each feature disappear on the path?
+
+        Parameters
+        ----------
+        path : List[HistoryItem]
+
+        Returns
+        -------
+            feature_importances_
+        """
+
+        current = path[0].selected.clone()
+        ans = torch.full(current.shape, float("inf"))
+        for save in islice(path, 1, None):
+            lambda_ = save.lambda_
+            diff = current & ~save.selected
+            ans[diff.nonzero().flatten()] = lambda_
+            current &= save.selected
+        return ans
+
+    def load(self, state_dict):
+        if isinstance(state_dict, HistoryItem):
+            state_dict = state_dict.state_dict
+        if self.model is None:
+            output_shape, input_shape = state_dict["skip.weight"].shape
+            self.model = LassoNet(
+                input_shape, *self.hidden_dims, output_shape, dropout=self.dropout
+            ).to(self.device)
+
+        self.model.load_state_dict(state_dict)
+        return self
+
+
+class LassoNetRegressor(
+    RegressorMixin,
+    MultiOutputMixin,
+    BaseLassoNet,
+):
+    """Use LassoNet as regressor"""
+
+    def _convert_y(self, y):
+        y = torch.FloatTensor(y).to(self.device)
+        if len(y.shape) == 1:
+            y = y.view(-1, 1)
+        return y
+
+    @staticmethod
+    def _output_shape(y):
+        return y.shape[1]
+
+    @staticmethod
+    def _lambda_max(X, y):
+        n_samples, _ = X.shape
+        return torch.tensor(X.T.dot(y)).abs().max().item() / n_samples
+
+    criterion = torch.nn.MSELoss(reduction="mean")
+
+    def predict(self, X):
+        with torch.no_grad():
+            ans = self.model(self._cast_input(X))
+        if isinstance(X, np.ndarray):
+            ans = ans.cpu().numpy()
+        return ans
+
+
+class LassoNetClassifier(
+    ClassifierMixin,
+    BaseLassoNet,
+):
+    """Use LassoNet as classifier"""
+
+    def _convert_y(self, y) -> torch.TensorType:
+        y = torch.LongTensor(y.long()).to(self.device)
+        assert len(y.shape) == 1, "y must be 1D"
+        return y
+
+    @staticmethod
+    def _output_shape(y):
+        return (y.max() + 1).item()
+
+    @staticmethod
+    def _lambda_max(X, y):
+        n = len(y)
+        d = LassoNetClassifier._output_shape(y)
+        y_bin = torch.full((n, d), False)
+        y_bin[torch.arange(n), y] = True
+        return LassoNetRegressor._lambda_max(X, y_bin)
+
+    criterion = torch.nn.CrossEntropyLoss(reduction="mean")
+
+    def predict(self, X):
+        with torch.no_grad():
+            ans = self.model(self._cast_input(X)).argmax(dim=1)
+        if isinstance(X, np.ndarray):
+            ans = ans.cpu().numpy()
+        return ans
+
+    def predict_proba(self, X):
+        with torch.no_grad():
+            ans = torch.softmax(self.model(self._cast_input(X)), -1)
+        if isinstance(X, np.ndarray):
+            ans = ans.cpu().numpy()
+        return ans
+
+
+def lassonet_path(X, y, task, *, X_val=None, y_val=None, **kwargs):
+    """
+    Parameters
+    ----------
+    X : array-like of shape (n_samples, n_features)
+        Training data
+    y : array-like of shape (n_samples,) or (n_samples, n_outputs)
+        Target values
+    task : str, must be "classification" or "regression"
+        Task
+    X_val : array-like of shape (n_samples, n_features)
+        Validation data
+    y_val : array-like of shape (n_samples,) or (n_samples, n_outputs)
+        Validation values
+
+    See BaseLassoNet for the other parameters.
+    """
+    if task == "classification":
+        model = LassoNetClassifier(**kwargs)
+    elif task == "regression":
+        model = LassoNetRegressor(**kwargs)
+    else:
+        raise ValueError('task must be "classification" or "regression"')
+    return model.path(X, y, X_val=X_val, y_val=y_val)
+    
+
+
+
+
+def for_pred(train_X,train_Y,val_X,val_Y,test_X,test_Y, 
+       n_classes,n_hidden1,n_hidden2, 
+       learning_rate,epochs,batch_size,num_batches,dropout,alpha):
+    
+    # get the number of variables
+    n_dim=train_X.shape[1]
+    
+    # create placeholders, initialize weights and biases, and define the loss function
+    X=tf.placeholder(tf.float64,[None,n_dim])
+    Y=tf.placeholder(tf.float64,[None,n_classes])
+    keep_prob=tf.placeholder(tf.float64)
+    
+    W1=0.01*np.random.randn(n_dim,n_hidden1).astype(np.float64)
+    B1=np.random.randn(n_hidden1).astype(np.float64)
+    W2=0.01*np.random.randn(n_hidden1,n_hidden2).astype(np.float64)
+    B2=np.random.randn(n_hidden2).astype(np.float64)
+    W3=0.01*np.random.randn(n_hidden2,n_classes).astype(np.float64)
+    B3=np.random.randn(n_classes).astype(np.float64)
+    
+    w1=tf.Variable(W1,name="weights1")
+    b1=tf.Variable(B1,name="biases1")
+    w2=tf.Variable(W2,name="weights2")
+    b2=tf.Variable(B2,name="biases2")
+    w3=tf.Variable(W3,name="weights3")
+    b3=tf.Variable(B3,name="biases3")
+    
+    out1=tf.nn.relu(tf.matmul(X,w1)+b1)
+    out1=tf.nn.dropout(out1,keep_prob,seed=seed)
+    out2=tf.nn.relu(tf.matmul(out1,w2)+b2)
+    out2=tf.nn.dropout(out2,keep_prob,seed=seed)
+    out3=tf.matmul(out2,w3)+b3
+    
+    cost=tf.square(out3-Y)
+    loss=tf.reduce_mean(cost)
+    op_train=tf.train.GradientDescentOptimizer(learning_rate).minimize(loss)
+    
+    init=tf.global_variables_initializer()
+    loss_val_trace=[]
+    accuracy_val_trace=[]
+    
+    # training using a GL_alpha stopping criterion
+    with tf.Session() as sess:
+        sess.run(init)
+        
+        i=1
+        for j in range(math.ceil(num_batches)):
+            sess.run(op_train,feed_dict={X:train_X[j*batch_size:(j+1)*batch_size],Y:train_Y[j*batch_size:(j+1)*batch_size],keep_prob:dropout})
+        loss_train=sess.run(loss,feed_dict={X:train_X,Y:train_Y,keep_prob:1.})
+        loss_val=sess.run(loss,feed_dict={X:val_X,Y:val_Y,keep_prob:1.})
+        pred_val=sess.run(out3,feed_dict={X:val_X,Y:val_Y,keep_prob:1.})
+        accuracy_val=np.mean(np.square(pred_val-val_Y))
+        loss_val_trace.append(loss_val)
+        accuracy_val_trace.append(accuracy_val)
+        
+        while i<epochs and loss_val/min(loss_val_trace)<1+alpha:
+            i+=1
+            for j in range(math.ceil(num_batches)):
+                sess.run(op_train,feed_dict={X:train_X[j*batch_size:(j+1)*batch_size],Y:train_Y[j*batch_size:(j+1)*batch_size],keep_prob:dropout})
+            loss_val=sess.run(loss,feed_dict={X:val_X,Y:val_Y,keep_prob:1.})
+            pred_val=sess.run(out3,feed_dict={X:val_X,Y:val_Y,keep_prob:1.})
+            accuracy_val=np.mean(np.square(pred_val-val_Y))
+            loss_val_trace.append(loss_val)
+            accuracy_val_trace.append(accuracy_val)
+            
+        # get the initial loss and accuracy on the test set (with all original variables)
+        loss_test=sess.run(loss,feed_dict={X:test_X,Y:test_Y,keep_prob:1.})
+        pred_test=sess.run(out3,feed_dict={X:test_X,Y:test_Y,keep_prob:1.})
+        accuracy_test=np.mean(np.square(pred_test-test_Y))
+        
+        initial=[loss_test,accuracy_test]
+        print('epochs:',i)
+        print('initial test loss:',loss_test,'initial test accuracy:',accuracy_test,'\n')
+        print('loss_val:', loss_val, 'loss_train', loss_train)
+
+    # return the initial loss and accuracy on the test set
+    return initial
